@@ -19,12 +19,16 @@ const upload = multer({ dest: 'uploads/' });
 const app = express();
 const porta = 3000;
 
-app.use(cors());
+app.use(cors({
+    origin: urlFrontend,
+    methods: ['GET', 'POST', 'PUT', 'DELETE']
+}));
 app.use(express.json());
 
 //chaves do banco de dados
 const supabase_url = process.env.SUPABASE_URL;
 const supabase_key = process.env.SUPABASE_KEY;
+const urlFrontend = process.env.FRONTEND_URL || '*';
 
 //estabelecendo conexao com o supabase
 const supabase = createClient(supabase_url, supabase_key);
