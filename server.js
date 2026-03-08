@@ -12,14 +12,12 @@ const {createClient} = require('@supabase/supabase-js');
 
 //excel
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
+const xlsx = require('xlsx');
+const upload = multer({ dest: 'uploads/' });
 
 //inicializa servidor
 const app = express();
 const porta = 3000;
-
-//importar excel
-const xlsx = require('xlsx');
 
 app.use(cors());
 app.use(express.json());
@@ -35,7 +33,7 @@ app.get('/', (requisicao, resposta) => {
     resposta.send('O motor da Copa PES esta rodando');
 });
 
-//Liga o servidor na porta definida
+//liga o servidor na porta definida
 app.listen(porta, () => {
     console.log(`Servidor rodando! Acesse http://localhost:${porta}`)
 });
@@ -94,6 +92,7 @@ app.post('/TEAMS', async (requisicao, resposta) => {
             color: color || "#FFFFFF", //cor padrao de nao for enviado
             ovr: ovr || 75,            //over padrao se nao for enviado
             formation: formation || "4-4-2", //formatacao padrao
+            squad: [],
             points: 0,
             goals_score: 0,
             goals_conceded: 0, 
@@ -155,75 +154,42 @@ app.delete('/TEAMS/:id', async (requisicao, resposta) => {
     }
 });
 
-//==== GERAR CAMPEONATO TODOS CONTRA TODOS ====//
-app.post('/GAMES/GERAR', async (requisicao, resposta) =>{
+//==== PONTOS CORRIDOS ====//
+app.post('/GAMES/GERAR', async (requisicao, resposta) => {
     try {
-        //suporta ida e volta
-        const formato = requisicao.body.formato || "single"; 
+        const formato = requisicao.body.formato || "single";
+        
+        //limpa jogos antigos
+        await supabase.from('GAMES').delete().neq('match_id', 0);
 
-        //busca todos os times que estao cadastrados
-        const { data: times, error: erroTimes } = await supabase.from('TEAMS').select('id, name_player');
-        if (erroTimes) throw erroTimes;
+        //pega todos os times válidos
+        const { data: times } = await supabase.from('TEAMS').select('*').neq('team_player', 'Sem Time');
+        
+        if (!times || times.length < 2) return resposta.status(400).json({ erro: "Times insuficientes." });
 
-        //precisa de pelo menos 2 pessoas para ter torneio
-        if (!times || times.length < 2) {
-            return resposta.status(400).json({ 
-                erro: "É preciso cadastrar pelo menos 2 jogadores para gerar os jogos!" 
-            });
-        }
+        //gera a tabela dividida por rodadas
+        let partidas = gerarTabelaRoundRobin(times);
 
-        //todos contra todos - apenas ida
-        const partidasParaSalvar = [];
-        let rodadaAtual = 1;
-        for (let i = 0; i < times.length; i++) {
-            for (let j = i + 1; j < times.length; j++) {
-                partidasParaSalvar.push({
-                    team_house_id: times[i].id,
-                    team_out_id: times[j].id,
-                    goals_home: 0,
-                    goals_out: 0,
-                    status_game: "Pendente",
-                    round: rodadaAtual
-                });
-                rodadaAtual++;
-            }
-        }
-
-        //returno
+        //se for Ida e Volta, clona a tabela invertendo os mandos
         if (formato === "homeaway") {
-            const totalJogosIda = partidasParaSalvar.length;
-            for (let k = 0; k < totalJogosIda; k++) {
-                const jogoIda = partidasParaSalvar[k];
-                partidasParaSalvar.push({
-                    team_house_id: jogoIda.team_out_id, 
-                    team_out_id: jogoIda.team_house_id, 
-                    goals_home: 0,
-                    goals_out: 0,
-                    status_game: "Pendente",
-                    round: rodadaAtual
-                });
-                rodadaAtual++;
-            }
+            const maxRodada = Math.max(...partidas.map(p => p.round));
+            const partidasVolta = partidas.map(p => ({
+                ...p,
+                team_house_id: p.team_out_id,
+                team_out_id: p.team_house_id,
+                round: p.round + maxRodada
+            }));
+            partidas = partidas.concat(partidasVolta);
         }
 
-        //salva todos os confrontos na tabela games
-        const { error: erroInsert } = await supabase
-            .from('GAMES')
-            .insert(partidasParaSalvar);
+        const { error } = await supabase.from('GAMES').insert(partidas);
+        if (error) throw error;
 
-        if (erroInsert) throw erroInsert;
-
-        return resposta.status(201).json({
-            mensagem: `Sucesso! O calendário foi gerado com ${partidasParaSalvar.length} partida!`,
-            total_jogos: partidasParaSalvar.length
-        });
-
+        return resposta.status(201).json({ mensagem: "Liga gerada com sucesso!" });
     } catch (erro) {
-        console.error("Erro ao gerar campeonato:", erro);
-        return resposta.status(500).json({ 
-            erro: "Falha interna ao tentar gerar as rodadas." 
-        });
-    }   
+        console.error("Erro ao gerar liga:", erro);
+        return resposta.status(500).json({ erro: "Erro interno." });
+    }
 });
 
 //==== MATA-MATA ====//
@@ -394,15 +360,24 @@ app.delete('/GAMES/RESET',  async(requisicao, resposta) =>{
         //neq e pra dizer ao banco de dados para apagar tudo que nao seja 0
         const {error: erroDelete} = await supabase.from('GAMES').delete().neq('match_id', 0); 
 
-        if (erroDelete) throw erroDelete;
+        if (errorDelete) throw errorDelete;
     
-        //zera pontos e gols na tabela times (CORREÇÃO: zerando também V, E, D, GC)
+        //usamos o UPDATE para manter os jogadores vivos no sistema, mas limpando o time usado
         const { error: erroUpdate } = await supabase.from('TEAMS').update({ 
-            points: 0, goals_score: 0, goals_conceded: 0, matches_played: 0, wins: 0, draws: 0, losses: 0 
+            team_player: "Sem Time", 
+            squad: [], 
+            points: 0, 
+            goals_score: 0, 
+            goals_conceded: 0, 
+            matches_played: 0, 
+            wins: 0, 
+            draws: 0, 
+            losses: 0, 
+            grupo: null
         }).neq('id', 0);
 
         if (erroUpdate) throw erroUpdate;
-        return resposta.status(200).json({mensagem: "Campeonato resetado com sucesso! Tabela de jogos apagada e pontuações zeradas."});
+        return resposta.status(200).json({mensagem: "Campeonato resetado com sucesso! Tabela de jogos apagada e times limpos, mas jogadores mantidos."});
 
     } catch (erro) {
         console.error("Erro ao resetar o campeonato:", erro);
@@ -523,14 +498,23 @@ app.post('/COPAS/FINALIZAR', async (requisicao, resposta) => {
 
         if (erroCopa) throw erroCopa;
 
-        //apaga os jogos e zera pontuacao
+        //apaga os jogos atuais, MAS apenas ATUALIZA os jogadores em vez de deletá-los
         await supabase.from('GAMES').delete().neq('match_id', 0);
         await supabase.from('TEAMS').update({ 
-            points: 0, goals_score: 0, goals_conceded: 0, matches_played: 0, wins: 0, draws: 0, losses: 0 
+            team_player: "Sem Time", 
+            squad: [], 
+            points: 0, 
+            goals_score: 0, 
+            goals_conceded: 0, 
+            matches_played: 0, 
+            wins: 0, 
+            draws: 0, 
+            losses: 0,
+            grupo: null
         }).neq('id', 0);
 
         return resposta.status(201).json({
-            mensagem: `🏆 ${nomeDaCopa} finalizada com sucesso! O histórico foi salvo e o campo está limpo para a próxima.`,
+            mensagem: `🏆 ${nomeDaCopa} finalizada com sucesso! O histórico foi salvo e os jogadores estão prontos para a próxima edição.`,
             copa: copaSalva
         });
 
@@ -543,7 +527,7 @@ app.post('/COPAS/FINALIZAR', async (requisicao, resposta) => {
 //==== LISTAR COPAS ====//
 app.get('/COPAS', async (requisicao, resposta) => {
     try {
-        //busca os dados de copas passadas
+        //busca os dados de copas passadas na tabela CUPS
         const { data: copas, error } = await supabase.from('CUPS').select('*').order('created_at', { ascending: false });
 
         if (error) throw error;
@@ -555,92 +539,92 @@ app.get('/COPAS', async (requisicao, resposta) => {
     }
 });
 
-//==== EXPORTAR COPA ====//
-app.get('/COPAS/EXPORTAR', async (requisicao, resposta) => {
+//==== IMPORTAR HISTORICO ====//
+app.post('/COPAS/IMPORTAR', upload.single('arquivo'), async (req, res) => {
     try {
-        //busca todo o historico de copas
-        const { data: copas, error } = await supabase.from('CUPS').select('*').order('created_at', { ascending: false });
+        if (!req.file) return res.status(400).json({ erro: "Nenhum arquivo enviado." });
+        
+        const workbook = xlsx.readFile(req.file.path);
+        const sheetName = workbook.SheetNames[0];
+        const data = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
-        if (error) throw error;
-        if (!copas || copas.length === 0) {
-            return resposta.status(404).json({ erro: "Nenhuma Copa encontrada para exportar." });
-        }
+        const copasMap = new Map();
+        
+        data.forEach(row => {
+            const nome_copa = String(row.nome_copa || "").trim();
+            if (!nome_copa) return;
 
-        //prepara os dados
-        const dadosParaExcel = copas.map(copa => {
+            if (!copasMap.has(nome_copa)) {
+                copasMap.set(nome_copa, {
+                    nome_copa: nome_copa,
+                    campeao: String(row.campeao || "").trim(),
+                    classificacao_final: []
+                });
+            }
             
-            //campeao e o primeiro (CORREÇÃO: Agora usa a coluna oficial do campeão)
-            return {
-                "Nome do Torneio": copa.nome_copa,
-                "Data de Encerramento": new Date(copa.created_at).toLocaleDateString('pt-BR'),
-                "Campeão": copa.campeao || "N/A" 
-            };
+            copasMap.get(nome_copa).classificacao_final.push({
+                name_player: String(row.name_player || "").trim(),
+                team_player: String(row.team_player || "").trim(),
+                points: Number(row.points) || 0,
+                wins: Number(row.wins) || 0,
+                draws: Number(row.draws) || 0,
+                losses: Number(row.losses) || 0,
+                goals_score: Number(row.goals_score) || 0,
+                goals_conceded: Number(row.goals_conceded) || 0
+            });
         });
 
-        //monta estrutura do excel
-        const planilha = xlsx.utils.json_to_sheet(dadosParaExcel); //folha
-        const arquivoExcel = xlsx.utils.book_new();               //arquivo
-        xlsx.utils.book_append_sheet(arquivoExcel, planilha, "Histórico dos Campeões"); //junta tudo
-
-        //converte excel para buffer
-        const buffer = xlsx.write(arquivoExcel, { type: 'buffer', bookType: 'xlsx' });
-
-        //avisa o navegador que e um arquivo para download
-        resposta.setHeader('Content-Disposition', 'attachment; filename="historico_copas_pes.xlsx"');
-        resposta.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        const copasParaInserir = Array.from(copasMap.values());
+        const { error } = await supabase.from('CUPS').insert(copasParaInserir);
         
-        return resposta.send(buffer);
+        if (error) throw error;
+        res.status(200).json({ mensagem: "Colunas importadas com sucesso!" });
 
-    } catch (erro) {
-        console.error("Erro ao exportar Excel:", erro);
-        return resposta.status(500).json({ erro: "Falha ao gerar o ficheiro Excel." });
+    } catch (error) {
+        console.error("Erro na importação:", error);
+        res.status(500).json({ erro: "Erro ao ler as colunas do Excel." });
     }
 });
 
-//==== IMPORTAR HISTORICO ====//
-app.post('/COPAS/IMPORTAR', upload.single('planilha'), async (requisicao, resposta) => {
+//==== EXPORTAR HISTORICO ====//
+app.get('/COPAS/EXPORTAR', async (req, res) => {
     try {
-        if (!requisicao.file) {
-            return resposta.status(400).json({ erro: "Nenhum arquivo Excel foi enviado!" });
-        }
+        const { data: copas, error } = await supabase.from('CUPS').select('*').order('created_at', { ascending: false });
+        if (error) throw error;
 
-        //le o arquivo da memoria
-        const workbook = xlsx.read(requisicao.file.buffer, { type: 'buffer' });
-        const nomePrimeiraAba = workbook.SheetNames[0];
-        const aba = workbook.Sheets[nomePrimeiraAba];
+        const linhasExcel = [];
 
-        //converte excel para json
-        const dadosExcel = xlsx.utils.sheet_to_json(aba);
-
-        if (dadosExcel.length === 0) {
-            return resposta.status(400).json({ erro: "A planilha está vazia!" });
-        }
-
-        //objeto de dados
-        const nomeCopa = dadosExcel[0]["Nome do Torneio"] || `Copa Importada - ${new Date().getFullYear()}`;
-        const campeaoImportado = dadosExcel[0]["Campeão"] || "N/A"; // CORREÇÃO: Lê o campeão da planilha
-
-        //salva tudo na coluna classificacao final
-        const { data: copaImportada, error: erroInsert } = await supabase
-            .from('CUPS')
-            .insert([{
-                nome_copa: nomeCopa,
-                campeao: campeaoImportado, // CORREÇÃO: Salva o campeão importado
-                classificacao_final: dadosExcel 
-            }])
-            .select()
-            .single();
-
-        if (erroInsert) throw erroInsert;
-
-        return resposta.status(201).json({
-            mensagem: "Histórico importado e salvo com sucesso!",
-            copa: copaImportada
+        copas.forEach(cup => {
+            if (cup.classificacao_final) {
+                cup.classificacao_final.forEach(stat => {
+                    linhasExcel.push({
+                        "nome_copa": cup.nome_copa,
+                        "campeao": cup.campeao,
+                        "name_player": stat.name_player,
+                        "team_player": stat.team_player,
+                        "points": stat.points || 0,
+                        "wins": stat.wins || 0,
+                        "draws": stat.draws || 0,
+                        "losses": stat.losses || 0,
+                        "goals_score": stat.goals_score || 0,
+                        "goals_conceded": stat.goals_conceded || 0
+                    });
+                });
+            }
         });
 
-    } catch (erro) {
-        console.error("Erro ao importar o Excel:", erro);
-        return resposta.status(500).json({ erro: "Falha ao processar o arquivo de importação." });
+        const worksheet = xlsx.utils.json_to_sheet(linhasExcel);
+        const workbook = xlsx.utils.book_new();
+        xlsx.utils.book_append_sheet(workbook, worksheet, "Historico");
+        const buffer = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+        
+        res.setHeader('Content-Disposition', 'attachment; filename="Historico_Copa_PES.xlsx"');
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.send(buffer);
+
+    } catch (error) {
+        console.error("Erro na exportação:", error);
+        res.status(500).json({ erro: "Falha ao gerar colunas do Excel." });
     }
 });
 
@@ -680,36 +664,91 @@ app.get('/RANKING-GERAL', async (requisicao, resposta) => {
 app.put('/COPAS/:id', async (requisicao, resposta) => {
     try {
         const idCopa = requisicao.params.id;
-        const dadosParaAtualizar = requisicao.body; //pode ser o nome_copa ou a classificacao_final corrigida
-
+        const dadosParaAtualizar = requisicao.body; 
         const { data: copaAtualizada, error } = await supabase.from('CUPS').update(dadosParaAtualizar).eq('id', idCopa).select().single();
-
         if (error) throw error;
-
-        return resposta.status(200).json({
-            mensagem: "Histórico da Copa atualizado com sucesso!",
-            copa: copaAtualizada
-        });
-
+        return resposta.status(200).json({ mensagem: "Histórico atualizado!", copa: copaAtualizada });
     } catch (erro) {
-        console.error("Erro ao editar copa:", erro);
-        return resposta.status(500).json({ erro: "Falha ao tentar editar o histórico." });
+        return resposta.status(500).json({ erro: "Erro ao editar copa." });
     }
 });
 
 app.delete('/COPAS/:id', async (requisicao, resposta) => {
     try {
         const idCopa = requisicao.params.id;
-
         const { error } = await supabase.from('CUPS').delete().eq('id', idCopa);
         if (error) throw error;
-
-        return resposta.status(200).json({
-            mensagem: `O histórico da Copa ID ${idCopa} foi apagado permanentemente.`
-        });
-
+        return resposta.status(200).json({ mensagem: `Copa ID ${idCopa} apagada.` });
     } catch (erro) {
-        console.error("Erro ao deletar copa:", erro);
-        return resposta.status(500).json({ erro: "Falha ao tentar apagar o histórico." });
+        return resposta.status(500).json({ erro: "Erro ao apagar copa." });
     }
 });
+
+//==== GERAR FASE DE GRUPOS ====//
+app.post('/GAMES/GERAR-GRUPOS', async (requisicao, resposta) => {
+    try {
+        const numGrupos = Number(requisicao.body.numGrupos) || 2;
+        const formato = requisicao.body.formato || "single";
+        await supabase.from('GAMES').delete().neq('match_id', 0);
+        const { data: times, error: erroTimes } = await supabase.from('TEAMS').select('*').neq('team_player', 'Sem Time');
+        if (erroTimes) throw erroTimes;
+        if (!times || times.length < numGrupos) return resposta.status(400).json({ erro: "Times insuficientes." });
+        const shuffled = [...times].sort(() => Math.random() - 0.5);
+        const nomesGrupos = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+        const timesComGrupo = [];
+        for (let i = 0; i < shuffled.length; i++) {
+            const grupoIndex = i % numGrupos;
+            timesComGrupo.push({ ...shuffled[i], grupo: nomesGrupos[grupoIndex] });
+        }
+        for (const t of timesComGrupo) await supabase.from('TEAMS').update({ grupo: t.grupo }).eq('id', t.id);
+        let todasPartidas = [];
+        for (let g = 0; g < numGrupos; g++) {
+            const letra = nomesGrupos[g];
+            const timesDoGrupo = timesComGrupo.filter(t => t.grupo === letra);
+            const partidasDoGrupo = gerarTabelaRoundRobin(timesDoGrupo);
+            todasPartidas.push(...partidasDoGrupo);
+        }
+        if (formato === "homeaway") {
+            const maxRodada = Math.max(...todasPartidas.map(p => p.round));
+            const partidasVolta = todasPartidas.map(p => ({
+                ...p, team_house_id: p.team_out_id, team_out_id: p.team_house_id, round: p.round + maxRodada
+            }));
+            todasPartidas = todasPartidas.concat(partidasVolta);
+        }
+        const { error: erroInsert } = await supabase.from('GAMES').insert(todasPartidas);
+        if (erroInsert) throw erroInsert;
+        return resposta.status(201).json({ mensagem: "Fase de grupos gerada!" });
+    } catch (erro) {
+        console.error("Erro ao gerar grupos:", erro);
+        return resposta.status(500).json({ erro: "Falha interna ao gerar fase de grupos." });
+    }
+});
+
+// --- FUNÇÃO MATEMÁTICA PARA GERAR RODADAS ROUND-ROBIN ---
+function gerarTabelaRoundRobin(timesValidos) {
+    const times = [...timesValidos];
+    if (times.length % 2 !== 0) {
+        times.push({ id: null, byes: true }); 
+    }
+    const totalRodadas = times.length - 1;
+    const jogosPorRodada = times.length / 2;
+    let partidas = [];
+    for (let r = 0; r < totalRodadas; r++) {
+        for (let i = 0; i < jogosPorRodada; i++) {
+            const casa = times[i];
+            const fora = times[times.length - 1 - i];
+            if (casa.id !== null && fora.id !== null) {
+                partidas.push({
+                    team_house_id: casa.id,
+                    team_out_id: fora.id,
+                    goals_home: 0,
+                    goals_out: 0,
+                    status_game: "Pendente",
+                    round: r + 1 
+                });
+            }
+        }
+        times.splice(1, 0, times.pop());
+    }
+    return partidas;
+}
